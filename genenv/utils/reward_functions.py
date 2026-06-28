@@ -59,18 +59,25 @@ class RewardManager:
         self.tokenizer = tokenizer
         self.num_examine = num_examine
 
-    def __call__(self, data: DataProto) -> torch.Tensor:
+    def __call__(self, data: DataProto, return_dict: bool = False):
         """
         Compute rewards for a batch of generated responses.
-        
+
         Args:
             data: DataProto containing prompts, responses, and ground truth
-            
+            return_dict: If True, return {"reward_tensor": ..., "reward_extra_info": {}}
+                (verl >= 0.4 calling convention). If False, return the tensor directly
+                (legacy GenEnv co-training convention).
+
         Returns:
-            Tensor of shape (batch_size, response_length) with rewards
+            Tensor of shape (batch_size, response_length) with rewards, or a dict
+            wrapping it when return_dict is True.
         """
         if 'rm_scores' in data.batch.keys():
-            return data.batch['rm_scores']
+            reward_tensor = data.batch['rm_scores']
+            if return_dict:
+                return {"reward_tensor": reward_tensor, "reward_extra_info": {}}
+            return reward_tensor
 
         reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
 
@@ -78,7 +85,7 @@ class RewardManager:
             i, data_item = args
             prompt_ids = data_item.batch['prompts']
             prompt_length = prompt_ids.shape[-1]
-            
+
             valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum()
             valid_prompt_ids = prompt_ids[-valid_prompt_length:]
 
@@ -94,7 +101,7 @@ class RewardManager:
 
             # >>> USER CUSTOMIZATION: Replace with your reward function <<<
             score = self.compute_reward(sequences_str, ground_truth)
-            
+
             return i, score, valid_response_length
 
         with ThreadPoolExecutor(max_workers=48) as executor:
@@ -104,6 +111,8 @@ class RewardManager:
         for i, score, valid_response_length in results:
             reward_tensor[i, valid_response_length - 1] = score
 
+        if return_dict:
+            return {"reward_tensor": reward_tensor, "reward_extra_info": {}}
         return reward_tensor
     
     def compute_reward(self, generated_text: str, ground_truth: Any) -> float:
