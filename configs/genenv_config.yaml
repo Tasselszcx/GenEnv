@@ -18,6 +18,7 @@ genenv:
   num_generations_per_prompt: 4       # Number of agent generations per prompt for evaluation
   alpha: 0.5                          # Target pass rate for Env reward
   beta: 2.0                           # Sharpness of Env reward curve
+  env_tensor_parallel_size: 1         # GPUs (== vLLM TP) reserved for Env generator worker
 
 # Environment LLM path (for task generation) -- GenEnv addition
 env_model_path: /path/to/your/env/model

@@ -45,22 +45,28 @@ from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer, ResourcePoolManager, Role
 from verl.single_controller.ray import RayWorkerGroup
 from verl.workers.fsdp_workers import ActorRolloutRefWorker
-from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
 
 from genenv.utils.reward_functions import RewardManager
 
 
-@ray.remote(num_gpus=8)
+@ray.remote
 class EnvGeneratorWorker:
     """
     Environment Generator Worker using vLLM for efficient inference.
-    
+
     This worker is responsible for generating new training tasks based on
     existing tasks and their solutions. Users should customize the generation
     prompt template in `_build_generation_prompt` method.
+
+    Note (verl 0.4.1 adaptation): the number of GPUs reserved for this Ray actor
+    must match ``tensor_parallel_size``. The original decorator hard-coded
+    ``num_gpus=8`` while the default ``tensor_parallel_size`` was 4, which is a
+    mismatch. We now leave the GPU count off the decorator and set it via
+    ``.options(num_gpus=tensor_parallel_size)`` at the call site, and default to
+    single-GPU TP since Qwen3-8B fits comfortably on one H800 (80GB).
     """
-    
-    def __init__(self, model_path: str, tensor_parallel_size: int = 4):
+
+    def __init__(self, model_path: str, tensor_parallel_size: int = 1):
         """
         Initialize the Environment Generator.
         
@@ -150,6 +156,11 @@ def run_genenv_training(config):
         # Update config with current train file
         agent_config = OmegaConf.create(OmegaConf.to_container(config, resolve=True))
         agent_config.data.train_files = current_train_file
+        # verl 0.4.1 fit() loops over trainer.total_epochs internally; the GenEnv outer
+        # loop already iterates epochs, so cap the inner trainer to a single epoch.
+        agent_config.trainer.total_epochs = 1
+        # Only validate before the very first agent-training pass to save time.
+        agent_config.trainer.val_before_train = (epoch == 0)
         
         # Load from checkpoint if not first epoch
         if epoch > 0:
@@ -179,7 +190,10 @@ def run_genenv_training(config):
             val_reward_fn=val_reward_fn
         )
         agent_trainer.init_workers()
-        agent_trainer.fit(epochs=1)
+        # verl 0.4.1: fit() takes no args; it loops over config.trainer.total_epochs.
+        # We drive the GenEnv outer epoch loop ourselves, so run one agent-training pass
+        # per outer epoch by giving the inner trainer a single-epoch config.
+        agent_trainer.fit()
         
         # =====================================================================
         # Phase 2: Evaluate Agent Performance on Current Dataset
@@ -248,77 +262,76 @@ def _evaluate_agent_performance(
 ) -> Dict[str, Dict]:
     """
     Evaluate agent performance on the current training dataset.
-    
+
+    Adapted to verl 0.4.1: we reuse the trainer's own ``train_dataloader`` (already
+    built in ``RayPPOTrainer.__init__`` from ``current_train_file``) and follow the
+    exact generation pattern used in ``RayPPOTrainer._validate`` so that the batch
+    carries ``raw_prompt_ids`` and the meta_info that the vLLM rollout worker needs.
+
     Returns:
         Dictionary mapping prompt -> {'scores': [...], 'gt': ground_truth}
     """
-    from torch.utils.data import DataLoader
-    
-    eval_dataset = RLHFDataset(
-        parquet_files=current_train_file,
-        tokenizer=agent_tokenizer,
-        prompt_key=config.data.prompt_key,
-        max_prompt_length=config.data.max_prompt_length
-    )
-    eval_dataloader = DataLoader(
-        dataset=eval_dataset,
-        batch_size=config.data.train_batch_size,
-        collate_fn=collate_fn
-    )
-    
-    prompt_accuracies = {}
+    prompt_accuracies: Dict[str, Dict] = {}
     n_gen = config.genenv.num_generations_per_prompt
-    
-    for batch_dict in eval_dataloader:
-        input_ids = batch_dict['input_ids']
-        attention_mask = batch_dict['attention_mask']
-        position_ids = batch_dict['position_ids']
-        batch_size = len(input_ids)
-        
-        # Decode prompts
-        prompts = []
+
+    for batch_dict in agent_trainer.train_dataloader:
+        test_batch: DataProto = DataProto.from_single_dict(batch_dict)
+        batch_size = len(test_batch)
+
+        # Decode the (left-padded) prompts to use as stable grouping keys, and grab
+        # the ground truths, before any keys get popped/repeated.
+        input_ids = test_batch.batch["input_ids"]
+        attention_mask = test_batch.batch["attention_mask"]
+        base_prompts = []
         for k in range(batch_size):
             valid_ids = input_ids[k][attention_mask[k] == 1]
-            prompts.append(agent_tokenizer.decode(valid_ids, skip_special_tokens=False))
-        
-        ground_truths = [item['ground_truth'] for item in batch_dict['reward_model']]
-        
-        # Expand batch for multiple generations
-        expanded_input_ids = input_ids.unsqueeze(1).repeat(1, n_gen, 1).view(batch_size * n_gen, -1)
-        expanded_attention_mask = attention_mask.unsqueeze(1).repeat(1, n_gen, 1).view(batch_size * n_gen, -1)
-        expanded_position_ids = position_ids.unsqueeze(1).repeat(1, n_gen, 1).view(batch_size * n_gen, -1)
-        
-        expanded_rm = []
+            base_prompts.append(agent_tokenizer.decode(valid_ids, skip_special_tokens=True))
+        base_gts = [item["ground_truth"] for item in test_batch.non_tensor_batch["reward_model"]]
+
+        # Repeat each sample n_gen times (interleaved) so reward_model/raw_prompt_ids
+        # stay aligned with the generations.
+        test_batch = test_batch.repeat(repeat_times=n_gen, interleave=True)
+
+        # Pop the keys needed for generation (mirrors _validate / fit).
+        batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+        non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
+        for opt_key in ("multi_modal_data", "raw_prompt", "tools_kwargs", "interaction_kwargs"):
+            if opt_key in test_batch.non_tensor_batch:
+                non_tensor_batch_keys_to_pop.append(opt_key)
+        gen_batch = test_batch.pop(
+            batch_keys=batch_keys_to_pop,
+            non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
+        )
+        gen_batch.meta_info = {
+            "eos_token_id": agent_tokenizer.eos_token_id,
+            "pad_token_id": agent_tokenizer.pad_token_id,
+            "recompute_log_prob": False,
+            "do_sample": True,  # sample so we can estimate per-prompt pass rate
+            "validate": True,
+        }
+
+        # pad to be divisible by dp size, generate, then unpad
+        gen_batch_padded, pad_size = pad_dataproto_to_divisor(
+            gen_batch, agent_trainer.actor_rollout_wg.world_size
+        )
+        output_padded = agent_trainer.actor_rollout_wg.generate_sequences(gen_batch_padded)
+        output = unpad_dataproto(output_padded, pad_size=pad_size)
+
+        test_batch = test_batch.union(output)
+
+        # Score with the reward function (verl 0.4.1 return_dict convention).
+        reward_result = reward_fn(test_batch, return_dict=True)
+        reward_tensor = reward_result["reward_tensor"]
+        rewards = reward_tensor.sum(-1).cpu().tolist()
+
+        # rewards are interleaved: [p0_g0, p0_g1, ..., p1_g0, ...]
         for i in range(batch_size):
-            expanded_rm.extend([batch_dict['reward_model'][i]] * n_gen)
-        
-        batch = DataProto.from_single_dict({
-            'input_ids': expanded_input_ids,
-            'attention_mask': expanded_attention_mask,
-            'position_ids': expanded_position_ids,
-            'reward_model': np.array(expanded_rm, dtype=object)
-        })
-        
-        batch_padded, pad_size = pad_dataproto_to_divisor(batch, agent_trainer.actor_rollout_wg.world_size)
-        generated_batch_padded = agent_trainer.actor_rollout_wg.generate_sequences(batch_padded)
-        generated_batch = unpad_dataproto(generated_batch_padded, pad_size)
-        
-        if not isinstance(generated_batch, DataProto):
-            generated_batch = DataProto(
-                batch=generated_batch.batch,
-                non_tensor_batch=generated_batch.non_tensor_batch,
-                meta_info=generated_batch.meta_info
-            )
-        
-        rewards = reward_fn(generated_batch).sum(-1).tolist()
-        
-        for i in range(batch_size):
-            prompt_text = prompts[i]
+            prompt_text = base_prompts[i]
             if prompt_text not in prompt_accuracies:
-                prompt_accuracies[prompt_text] = {'scores': [], 'gt': ground_truths[i]}
+                prompt_accuracies[prompt_text] = {"scores": [], "gt": base_gts[i]}
             prompt_rewards = rewards[i * n_gen: (i + 1) * n_gen]
-            prompt_accuracies[prompt_text]['scores'].extend(prompt_rewards)
-    
+            prompt_accuracies[prompt_text]["scores"].extend(prompt_rewards)
+
     return prompt_accuracies
 
 
@@ -358,8 +371,13 @@ def _generate_new_tasks(
     Modify the prompt template and parsing logic for your specific domain.
     """
     print(f"[GenEnv] Generating new tasks using Env LLM...")
-    
-    env_worker = EnvGeneratorWorker.remote(env_model_path)
+
+    # verl 0.4.1: reserve exactly tensor_parallel_size GPUs for the actor so the
+    # Ray GPU reservation matches vLLM's tensor parallel world size.
+    env_tp = int(config.genenv.get("env_tensor_parallel_size", 1))
+    env_worker = EnvGeneratorWorker.options(num_gpus=env_tp).remote(
+        env_model_path, tensor_parallel_size=env_tp
+    )
     
     prompts_list = []
     original_infos = []
@@ -438,24 +456,36 @@ def _augment_dataset(
 
 
 def _cleanup_trainer(trainer):
-    """Release trainer resources."""
+    """Release trainer resources.
+
+    verl 0.4.1 adaptation: there is no ``trainer.wg_dicts``. Worker groups are stored
+    as direct attributes (``actor_rollout_wg``, ``ref_policy_wg``, ``critic_wg``,
+    ``rm_wg``), each a ``RayWorkerGroup`` exposing ``.workers``. We kill the workers
+    of whichever groups exist, then tear down the placement groups.
+    """
     from ray.util.placement_group import remove_placement_group
-    
+
     print("[GenEnv] Releasing trainer resources...")
-    
-    for wg in trainer.wg_dicts:
-        for worker in wg.workers:
-            ray.kill(worker)
-    
-    if hasattr(trainer, 'resource_pool_manager'):
+
+    for wg_attr in ("actor_rollout_wg", "ref_policy_wg", "critic_wg", "rm_wg"):
+        wg = getattr(trainer, wg_attr, None)
+        if wg is None:
+            continue
+        for worker in getattr(wg, "workers", []):
+            try:
+                ray.kill(worker)
+            except Exception:
+                pass
+
+    if hasattr(trainer, "resource_pool_manager"):
         for pool_name, pool in trainer.resource_pool_manager.resource_pool_dict.items():
-            if hasattr(pool, 'pgs') and pool.pgs:
+            if hasattr(pool, "pgs") and pool.pgs:
                 for pg in pool.pgs:
                     try:
                         remove_placement_group(pg)
                     except Exception:
                         pass
-    
+
     del trainer
     gc.collect()
     time.sleep(5)
